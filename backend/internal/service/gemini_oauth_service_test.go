@@ -717,6 +717,102 @@ func TestGeminiOAuthService_Stop_NoPanic(t *testing.T) {
 	svc.Stop()
 }
 
+func TestGeminiOAuthService_GenerateAuthURL_UsesActiveProxyFallback(t *testing.T) {
+	t.Setenv(geminicli.GeminiCLIOAuthClientSecretEnv, "test-built-in-secret")
+
+	proxyRepo := &mockGeminiProxyRepo{
+		listActiveFunc: func(ctx context.Context) ([]Proxy, error) {
+			return []Proxy{
+				{
+					ID:       7,
+					Protocol: "http",
+					Host:     "proxy.test",
+					Port:     3128,
+					Status:   StatusActive,
+				},
+			}, nil
+		},
+	}
+
+	svc := NewGeminiOAuthService(proxyRepo, nil, nil, nil, &config.Config{})
+	defer svc.Stop()
+
+	result, err := svc.GenerateAuthURL(context.Background(), nil, "https://example.com/auth/callback", "", "google_one", GeminiTierGoogleOneFree)
+	if err != nil {
+		t.Fatalf("GenerateAuthURL 返回错误: %v", err)
+	}
+
+	session, ok := svc.sessionStore.Get(result.SessionID)
+	if !ok {
+		t.Fatal("session 应存在")
+	}
+	if session.ProxyURL != "http://proxy.test:3128" {
+		t.Fatalf("ProxyURL 不匹配: got=%q", session.ProxyURL)
+	}
+}
+
+func TestGeminiOAuthService_ExchangeCode_UsesActiveProxyFallback(t *testing.T) {
+	t.Parallel()
+
+	proxyRepo := &mockGeminiProxyRepo{
+		listActiveFunc: func(ctx context.Context) ([]Proxy, error) {
+			return []Proxy{
+				{
+					ID:       9,
+					Protocol: "http",
+					Host:     "proxy.test",
+					Port:     3128,
+					Status:   StatusActive,
+				},
+			}, nil
+		},
+	}
+	client := &mockGeminiOAuthClient{
+		exchangeCodeFunc: func(ctx context.Context, oauthType, code, codeVerifier, redirectURI, proxyURL string) (*geminicli.TokenResponse, error) {
+			if proxyURL != "http://proxy.test:3128" {
+				t.Fatalf("proxyURL 不匹配: got=%q", proxyURL)
+			}
+			return &geminicli.TokenResponse{
+				AccessToken:  "at",
+				RefreshToken: "rt",
+				TokenType:    "Bearer",
+				ExpiresIn:    3600,
+				Scope:        "scope",
+			}, nil
+		},
+	}
+	cfg := &config.Config{
+		Gemini: config.GeminiConfig{
+			OAuth: config.GeminiOAuthConfig{
+				ClientID:     "custom-client",
+				ClientSecret: "custom-secret",
+			},
+		},
+	}
+	svc := NewGeminiOAuthService(proxyRepo, client, nil, nil, cfg)
+	defer svc.Stop()
+	svc.sessionStore.Set("test-session", &geminicli.OAuthSession{
+		State:        "correct-state",
+		CodeVerifier: "verifier",
+		OAuthType:    "ai_studio",
+		TierID:       GeminiTierAIStudioFree,
+		RedirectURI:  geminicli.AIStudioOAuthRedirectURI,
+		CreatedAt:    time.Now(),
+	})
+
+	info, err := svc.ExchangeCode(context.Background(), &GeminiExchangeCodeInput{
+		SessionID: "test-session",
+		State:     "correct-state",
+		Code:      "code",
+	})
+	if err != nil {
+		t.Fatalf("ExchangeCode 返回错误: %v", err)
+	}
+	if info.AccessToken != "at" {
+		t.Fatalf("AccessToken 不匹配: got=%q", info.AccessToken)
+	}
+}
+
 // =====================
 // mock: GeminiOAuthClient
 // =====================
@@ -768,7 +864,8 @@ func (m *mockGeminiCodeAssistClient) OnboardUser(ctx context.Context, accessToke
 // =====================
 
 type mockGeminiProxyRepo struct {
-	getByIDFunc func(ctx context.Context, id int64) (*Proxy, error)
+	getByIDFunc    func(ctx context.Context, id int64) (*Proxy, error)
+	listActiveFunc func(ctx context.Context) ([]Proxy, error)
 }
 
 func (m *mockGeminiProxyRepo) Create(ctx context.Context, proxy *Proxy) error { panic("not impl") }
@@ -792,7 +889,12 @@ func (m *mockGeminiProxyRepo) ListWithFilters(ctx context.Context, params pagina
 func (m *mockGeminiProxyRepo) ListWithFiltersAndAccountCount(ctx context.Context, params pagination.PaginationParams, protocol, status, search string) ([]ProxyWithAccountCount, *pagination.PaginationResult, error) {
 	panic("not impl")
 }
-func (m *mockGeminiProxyRepo) ListActive(ctx context.Context) ([]Proxy, error) { panic("not impl") }
+func (m *mockGeminiProxyRepo) ListActive(ctx context.Context) ([]Proxy, error) {
+	if m.listActiveFunc != nil {
+		return m.listActiveFunc(ctx)
+	}
+	return nil, nil
+}
 func (m *mockGeminiProxyRepo) ListActiveWithAccountCount(ctx context.Context) ([]ProxyWithAccountCount, error) {
 	panic("not impl")
 }

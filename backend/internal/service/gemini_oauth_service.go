@@ -113,13 +113,7 @@ func (s *GeminiOAuthService) GenerateAuthURL(ctx context.Context, proxyID *int64
 		return nil, fmt.Errorf("failed to generate session ID: %w", err)
 	}
 
-	var proxyURL string
-	if proxyID != nil {
-		proxy, err := s.proxyRepo.GetByID(ctx, *proxyID)
-		if err == nil && proxy != nil {
-			proxyURL = proxy.URL()
-		}
-	}
+	proxyURL := s.resolveGeminiOAuthProxyURL(ctx, proxyID, "")
 
 	// OAuth client selection:
 	// - code_assist: always use built-in Gemini CLI OAuth client (public)
@@ -181,6 +175,44 @@ func (s *GeminiOAuthService) GenerateAuthURL(ctx context.Context, proxyID *int64
 		SessionID: sessionID,
 		State:     state,
 	}, nil
+}
+
+func (s *GeminiOAuthService) resolveGeminiOAuthProxyURL(ctx context.Context, proxyID *int64, fallbackURL string) string {
+	if proxyID != nil && s.proxyRepo != nil {
+		proxy, err := s.proxyRepo.GetByID(ctx, *proxyID)
+		if err == nil && proxy != nil {
+			return proxy.URL()
+		}
+		if err != nil {
+			logger.LegacyPrintf("service.gemini_oauth", "[GeminiOAuth] WARNING: Failed to resolve proxy_id=%d: %v", *proxyID, err)
+		}
+	}
+
+	if trimmed := strings.TrimSpace(fallbackURL); trimmed != "" {
+		return trimmed
+	}
+
+	if s.proxyRepo == nil {
+		return ""
+	}
+
+	proxies, err := s.proxyRepo.ListActive(ctx)
+	if err != nil {
+		logger.LegacyPrintf("service.gemini_oauth", "[GeminiOAuth] WARNING: Failed to list active proxies: %v", err)
+		return ""
+	}
+	for _, proxy := range proxies {
+		if !proxy.IsActive() {
+			continue
+		}
+		proxyURL := strings.TrimSpace(proxy.URL())
+		if proxyURL == "" {
+			continue
+		}
+		logger.LegacyPrintf("service.gemini_oauth", "[GeminiOAuth] Using active proxy fallback: proxy_id=%d", proxy.ID)
+		return proxyURL
+	}
+	return ""
 }
 
 type GeminiExchangeCodeInput struct {
@@ -456,13 +488,7 @@ func (s *GeminiOAuthService) ExchangeCode(ctx context.Context, input *GeminiExch
 		return nil, fmt.Errorf("invalid state")
 	}
 
-	proxyURL := session.ProxyURL
-	if input.ProxyID != nil {
-		proxy, err := s.proxyRepo.GetByID(ctx, *input.ProxyID)
-		if err == nil && proxy != nil {
-			proxyURL = proxy.URL()
-		}
-	}
+	proxyURL := s.resolveGeminiOAuthProxyURL(ctx, input.ProxyID, session.ProxyURL)
 	logger.LegacyPrintf("service.gemini_oauth", "[GeminiOAuth] ProxyURL: %s", proxyURL)
 
 	redirectURI := session.RedirectURI
