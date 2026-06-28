@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/big"
@@ -21,6 +22,7 @@ import (
 
 var (
 	ErrEmailNotConfigured    = infraerrors.ServiceUnavailable("EMAIL_NOT_CONFIGURED", "email service not configured")
+	ErrEmailDeliveryFailed   = infraerrors.ServiceUnavailable("EMAIL_DELIVERY_FAILED", "failed to send email")
 	ErrInvalidVerifyCode     = infraerrors.BadRequest("INVALID_VERIFY_CODE", "invalid or expired verification code")
 	ErrVerifyCodeTooFrequent = infraerrors.TooManyRequests("VERIFY_CODE_TOO_FREQUENT", "please wait before requesting a new code")
 	ErrVerifyCodeMaxAttempts = infraerrors.TooManyRequests("VERIFY_CODE_MAX_ATTEMPTS", "too many failed attempts, please request a new code")
@@ -365,7 +367,7 @@ func (s *EmailService) SendVerifyCode(ctx context.Context, email, siteName strin
 			return nil
 		}
 		if !shouldFallbackNotificationEmail(err) {
-			return err
+			return s.verifyCodeDeliveryError(ctx, email, err)
 		}
 		slog.Warn("failed to send templated verification email, falling back to legacy template", "recipient_hash", notificationEmailHash(email), "error", err)
 	}
@@ -376,10 +378,22 @@ func (s *EmailService) SendVerifyCode(ctx context.Context, email, siteName strin
 
 	// 发送邮件
 	if err := s.SendEmail(ctx, email, subject, body); err != nil {
-		return fmt.Errorf("send email: %w", err)
+		return s.verifyCodeDeliveryError(ctx, email, fmt.Errorf("send email: %w", err))
 	}
 
 	return nil
+}
+
+func (s *EmailService) verifyCodeDeliveryError(ctx context.Context, email string, err error) error {
+	if s != nil && s.cache != nil {
+		if deleteErr := s.cache.DeleteVerificationCode(ctx, email); deleteErr != nil {
+			slog.Warn("failed to delete verification code after email delivery failure", "recipient_hash", notificationEmailHash(email), "error", deleteErr)
+		}
+	}
+	if errors.Is(err, ErrEmailNotConfigured) {
+		return err
+	}
+	return ErrEmailDeliveryFailed.WithCause(err)
 }
 
 // VerifyCode 验证验证码

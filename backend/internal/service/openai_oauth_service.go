@@ -62,16 +62,9 @@ func (s *OpenAIOAuthService) GenerateAuthURL(ctx context.Context, proxyID *int64
 		return nil, infraerrors.Newf(http.StatusInternalServerError, "OPENAI_OAUTH_SESSION_FAILED", "failed to generate session ID: %v", err)
 	}
 
-	// Get proxy URL if specified
-	var proxyURL string
-	if proxyID != nil {
-		proxy, err := s.proxyRepo.GetByID(ctx, *proxyID)
-		if err != nil {
-			return nil, infraerrors.Newf(http.StatusBadRequest, "OPENAI_OAUTH_PROXY_NOT_FOUND", "proxy not found: %v", err)
-		}
-		if proxy != nil {
-			proxyURL = proxy.URL()
-		}
+	proxyURL, err := s.resolveOpenAIOAuthProxyURL(ctx, proxyID, "")
+	if err != nil {
+		return nil, err
 	}
 
 	// Use default redirect URI if not specified
@@ -99,6 +92,49 @@ func (s *OpenAIOAuthService) GenerateAuthURL(ctx context.Context, proxyID *int64
 		AuthURL:   authURL,
 		SessionID: sessionID,
 	}, nil
+}
+
+func (s *OpenAIOAuthService) resolveOpenAIOAuthProxyURL(ctx context.Context, proxyID *int64, fallbackURL string) (string, error) {
+	if proxyID != nil {
+		if s.proxyRepo == nil {
+			return "", infraerrors.New(http.StatusBadRequest, "OPENAI_OAUTH_PROXY_NOT_FOUND", "proxy repository is not configured")
+		}
+		proxy, err := s.proxyRepo.GetByID(ctx, *proxyID)
+		if err != nil {
+			return "", infraerrors.Newf(http.StatusBadRequest, "OPENAI_OAUTH_PROXY_NOT_FOUND", "proxy not found: %v", err)
+		}
+		if proxy != nil {
+			return proxy.URL(), nil
+		}
+		return "", infraerrors.New(http.StatusBadRequest, "OPENAI_OAUTH_PROXY_NOT_FOUND", "proxy not found")
+	}
+
+	if trimmed := strings.TrimSpace(fallbackURL); trimmed != "" {
+		return trimmed, nil
+	}
+
+	if s.proxyRepo == nil {
+		return "", nil
+	}
+
+	proxies, err := s.proxyRepo.ListActive(ctx)
+	if err != nil {
+		slog.Warn("openai_oauth_active_proxy_fallback_failed", "error", err)
+		return "", nil
+	}
+	for _, proxy := range proxies {
+		if !proxy.IsActive() {
+			continue
+		}
+		proxyURL := strings.TrimSpace(proxy.URL())
+		if proxyURL == "" {
+			continue
+		}
+		slog.Warn("openai_oauth_using_active_proxy_fallback", "proxy_id", proxy.ID)
+		return proxyURL, nil
+	}
+
+	return "", nil
 }
 
 // OpenAIExchangeCodeInput represents the input for code exchange
@@ -141,16 +177,9 @@ func (s *OpenAIOAuthService) ExchangeCode(ctx context.Context, input *OpenAIExch
 		return nil, infraerrors.New(http.StatusBadRequest, "OPENAI_OAUTH_INVALID_STATE", "invalid oauth state")
 	}
 
-	// Get proxy URL: prefer input.ProxyID, fallback to session.ProxyURL
-	proxyURL := session.ProxyURL
-	if input.ProxyID != nil {
-		proxy, err := s.proxyRepo.GetByID(ctx, *input.ProxyID)
-		if err != nil {
-			return nil, infraerrors.Newf(http.StatusBadRequest, "OPENAI_OAUTH_PROXY_NOT_FOUND", "proxy not found: %v", err)
-		}
-		if proxy != nil {
-			proxyURL = proxy.URL()
-		}
+	proxyURL, err := s.resolveOpenAIOAuthProxyURL(ctx, input.ProxyID, session.ProxyURL)
+	if err != nil {
+		return nil, err
 	}
 
 	// Use redirect URI from session or input

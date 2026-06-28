@@ -203,15 +203,14 @@ func (h *AuthHandler) SendVerifyCode(c *gin.Context) {
 		return
 	}
 
-	result, err := h.authService.SendVerifyCodeAsync(c.Request.Context(), req.Email, c.GetHeader("Accept-Language"))
-	if err != nil {
+	if err := h.authService.SendVerifyCode(c.Request.Context(), req.Email, c.GetHeader("Accept-Language")); err != nil {
 		response.ErrorFrom(c, err)
 		return
 	}
 
 	response.Success(c, SendVerifyCodeResponse{
 		Message:   "Verification code sent successfully",
-		Countdown: result.Countdown,
+		Countdown: 60,
 	})
 }
 

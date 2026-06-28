@@ -5,6 +5,7 @@ package service
 import (
 	"context"
 	"errors"
+	"net"
 	"testing"
 	"time"
 
@@ -62,8 +63,10 @@ func (s *settingRepoStub) Delete(ctx context.Context, key string) error {
 }
 
 type emailCacheStub struct {
-	data *VerificationCodeData
-	err  error
+	data        *VerificationCodeData
+	err         error
+	setCalls    int
+	deleteCalls int
 }
 
 type defaultSubscriptionAssignerStub struct {
@@ -167,10 +170,14 @@ func (s *emailCacheStub) GetVerificationCode(ctx context.Context, email string) 
 }
 
 func (s *emailCacheStub) SetVerificationCode(ctx context.Context, email string, data *VerificationCodeData, ttl time.Duration) error {
+	s.setCalls++
+	s.data = data
 	return nil
 }
 
 func (s *emailCacheStub) DeleteVerificationCode(ctx context.Context, email string) error {
+	s.deleteCalls++
+	s.data = nil
 	return nil
 }
 
@@ -428,6 +435,49 @@ func TestAuthService_SendVerifyCode_EmailSuffixNotAllowed(t *testing.T) {
 	require.Contains(t, appErr.Message, "@example.com")
 	require.Contains(t, appErr.Message, "@company.com")
 	require.Equal(t, "2", appErr.Metadata["allowed_suffix_count"])
+}
+
+func TestAuthService_SendVerifyCode_EmailNotConfiguredClearsCode(t *testing.T) {
+	repo := &userRepoStub{}
+	cache := &emailCacheStub{}
+	service := newAuthService(repo, map[string]string{
+		SettingKeyRegistrationEnabled: "true",
+	}, cache, nil)
+
+	err := service.SendVerifyCode(context.Background(), "user@example.com")
+
+	require.ErrorIs(t, err, ErrEmailNotConfigured)
+	require.Equal(t, 1, cache.setCalls)
+	require.Equal(t, 1, cache.deleteCalls)
+	require.Nil(t, cache.data)
+}
+
+func TestAuthService_SendVerifyCode_SMTPDeliveryFailureClearsCode(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := listener.Addr().String()
+	require.NoError(t, listener.Close())
+	host, port, err := net.SplitHostPort(addr)
+	require.NoError(t, err)
+
+	repo := &userRepoStub{}
+	cache := &emailCacheStub{}
+	service := newAuthService(repo, map[string]string{
+		SettingKeyRegistrationEnabled: "true",
+		SettingKeySMTPHost:            host,
+		SettingKeySMTPPort:            port,
+		SettingKeySMTPUsername:        "user",
+		SettingKeySMTPPassword:        "password",
+		SettingKeySMTPFrom:            "noreply@example.com",
+		SettingKeySMTPUseTLS:          "false",
+	}, cache, nil)
+
+	err = service.SendVerifyCode(context.Background(), "user@example.com")
+
+	require.ErrorIs(t, err, ErrEmailDeliveryFailed)
+	require.Equal(t, 1, cache.setCalls)
+	require.Equal(t, 1, cache.deleteCalls)
+	require.Nil(t, cache.data)
 }
 
 func TestAuthService_Register_CreateError(t *testing.T) {
